@@ -54,7 +54,6 @@ class WarmupRunner:
         torch.rand(8)
         if self.model_device.type == "cuda":
             torch.rand(8, device=self.model_device)
-            torch.cuda._sleep(1_000_000)  # noqa: leading-underscore
             event = torch.cuda.Event()
             event.record()
             self.completion_events.append(event)
@@ -185,12 +184,20 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     scheduler, _, _ = warmup_backend
     runner = WarmupRunner(fail_step=fail_step, device="cuda")
     original_release = warmup_module.release_kv_cache
+    original_synchronize = torch.accelerator.synchronize
     original_rng_state = torch.cuda.get_rng_state()
+    synchronized_steps = []
+
+    def synchronize(device):
+        original_synchronize(device)
+        synchronized_steps.append(len(runner.calls))
 
     def release(request, tree_cache, *, checkpoint):
+        assert synchronized_steps and synchronized_steps[-1] == len(runner.calls)
         assert all(event.query() for event in runner.completion_events)
         original_release(request, tree_cache, checkpoint=checkpoint)
 
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
     monkeypatch.setattr(warmup_module, "release_kv_cache", release)
     if fail_step is None:
         warmup_session_lm(scheduler, runner)
@@ -216,11 +223,19 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
         ),
     ],
 )
-@pytest.mark.parametrize("fail_step,token_capacity", [(None, 128), (4, 128), (None, 2)])
+@pytest.mark.parametrize(
+    "fail_step,request_capacity,token_capacity,expected_error",
+    [
+        (None, 4, 128, None),
+        (4, 4, 128, "injected forward failure"),
+        (None, 4, 2, "Out of memory"),
+        (None, 3, 128, "alloc_req_slots runs out of memory"),
+    ],
+)
 def test_real_batch_preparation_returns_request_and_token_capacity(
-    device, fail_step, token_capacity
+    device, fail_step, request_capacity, token_capacity, expected_error
 ):
-    request_pool = ReqToTokenPool(4, 64, device, False)
+    request_pool = ReqToTokenPool(request_capacity, 64, device, False)
     allocator = TokenToKVPoolAllocator(
         token_capacity, torch.float32, device, None, False
     )
@@ -256,13 +271,14 @@ def test_real_batch_preparation_returns_request_and_token_capacity(
             ),
         )
         runner = WarmupRunner(fail_step=fail_step, device=device)
-        if fail_step is None and token_capacity == 128:
+        if expected_error is None:
             warmup_session_lm(scheduler, runner)
             assert [len(call) for call in runner.calls] == [1, 1, 2, 2, 3, 3]
         else:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError, match=expected_error):
                 warmup_session_lm(scheduler, runner)
-        assert request_pool.available_size() == 3
+        assert request_pool.available_size() == request_capacity - 1
+        assert len(set(request_pool.free_slots)) == request_capacity - 1
         assert allocator.available_size() == token_capacity - 1
         assert torch.unique(allocator.free_pages).numel() == token_capacity - 1
         assert not torch.isin(foreign_tokens, allocator.free_pages).any()
