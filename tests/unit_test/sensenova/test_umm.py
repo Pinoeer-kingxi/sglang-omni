@@ -18,6 +18,7 @@ from sglang_omni.config.runtime import (
     resolve_stage_factory_kwargs,
     resolve_stage_typed_kwargs,
 )
+from sglang_omni.models.sensenova_u1.cache_dit import SenseNovaCacheDit
 from sglang_omni.models.sensenova_u1.cancellation import (
     SENSENOVA_DEADLINE_METADATA_KEY,
     GenerationScope,
@@ -29,7 +30,10 @@ from sglang_omni.models.sensenova_u1.image_processing import (
     prepare_reference_images,
     resolve_reference_output_size,
 )
-from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
+from sglang_omni.models.sensenova_u1.sampling import (
+    SenseNovaU1ImageEditSampling,
+    SenseNovaU1Sampling,
+)
 from sglang_omni.models.sensenova_u1.umm import SenseNovaUMMAdapter
 from sglang_omni.pipeline.umm import (
     UMMController,
@@ -113,6 +117,114 @@ def test_invalid_request_never_dispatches(
         )
     assert not controller.contexts
     assert not controller.adapter.executions
+
+
+@pytest.mark.parametrize("validation_path", ["admission", "preflight", "execution"])
+def test_invalid_cache_parameters_remain_bad_requests(
+    controller: UMMController,
+    validation_path: Literal["admission", "preflight", "execution"],
+) -> None:
+    """Invalid cache parameters inherited from an enabled server default returned 500."""
+    parameters: dict[str, JsonValue] = {
+        "width": 32,
+        "height": 32,
+        "cache_dit_params": {"unknown": 1},
+    }
+    if validation_path == "admission":
+        parameters["enable_cache_dit"] = True
+    else:
+        pass
+    cache = SenseNovaCacheDit(enabled_by_default=True, default_params=None)
+    try:
+        with pytest.raises(UMMRequestError, match="unsupported Cache-DiT") as raised:
+            phase = controller.transition(
+                StagePayload("request", OmniRequest("prompt", parameters), None)
+            )
+            assert validation_path != "admission"
+            assert phase is not None
+            sampling = SenseNovaU1Sampling.from_params(phase.request.params)
+            if validation_path == "preflight":
+                cache.validate_request(
+                    torch.nn.Module(),
+                    params=sampling.cache_dit_params,
+                    steps=sampling.num_inference_steps,
+                )
+            else:
+                cache.prepare(
+                    torch.nn.Module(),
+                    enabled=sampling.enable_cache_dit,
+                    params=sampling.cache_dit_params,
+                    steps=sampling.num_inference_steps,
+                    branch_count=1,
+                    cfg_interval=(0.0, 1.0),
+                )
+        assert generation_error_status_code(RuntimeError(str(raised.value))) == 400
+    finally:
+        controller.abort("request")
+    assert not controller.contexts
+    assert not controller.adapter.executions
+    assert cache.adapter is None
+
+
+def test_missing_cache_backend_remains_a_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable cache backend must not be reported as invalid request parameters."""
+    monkeypatch.setattr("sglang_omni.models.sensenova_u1.cache_dit.cache_dit", None)
+    cache = SenseNovaCacheDit(enabled_by_default=True, default_params=None)
+    with pytest.raises(RuntimeError, match="Cache-DiT is required") as raised:
+        cache.validate_request(torch.nn.Module(), params=None, steps=1)
+    assert generation_error_status_code(RuntimeError(str(raised.value))) == 500
+
+
+@pytest.mark.parametrize("request_kind", ["text", "edit_output", "edit_reference"])
+@pytest.mark.parametrize("is_portrait", [False, True])
+@pytest.mark.parametrize("long_edge_pixels", [160000, 160032])
+def test_vision_axis_bound_is_checked_before_dispatch(
+    controller: UMMController,
+    encoded_image: str,
+    request_kind: Literal["text", "edit_output", "edit_reference"],
+    is_portrait: bool,
+    long_edge_pixels: int,
+) -> None:
+    """A small total pixel count allowed an axis to overflow the vision position cache."""
+    width, height = (32, long_edge_pixels) if is_portrait else (long_edge_pixels, 32)
+    parameters = {"width": width, "height": height, "num_inference_steps": 1}
+    if request_kind == "text":
+        inputs = "prompt"
+    else:
+        if request_kind == "edit_reference":
+            image_buffer = io.BytesIO()
+            Image.new("RGB", (width, height)).save(image_buffer, format="PNG")
+            references = [
+                encoded_image,
+                base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+            ]
+            parameters.update(width=32, height=32)
+        else:
+            references = [encoded_image]
+        parameters.update(do_resize=False, size_explicit=True)
+        inputs = {"task": "image_edit", "prompt": "edit", "image_b64": references}
+    request = OmniRequest(inputs, parameters)
+    if long_edge_pixels > 160000:
+        with pytest.raises(UMMRequestError, match="160000") as raised:
+            controller.transition(StagePayload("request", request, None))
+        assert generation_error_status_code(raised.value) == 400
+    else:
+        assert controller.transition(StagePayload("request", request, None)) is not None
+        controller.abort("request")
+    assert not controller.contexts
+    assert not controller.adapter.executions
+    assert controller.outbox.empty()
+    assert (
+        controller.transition(
+            StagePayload(
+                "next", OmniRequest("prompt", {"width": 32, "height": 32}), None
+            )
+        )
+        is not None
+    )
+    controller.abort("next")
 
 
 def test_generate_edit_with_several_outputs_names_the_images_api(
@@ -521,19 +633,26 @@ def test_disabled_resize_preserves_small_reference_admission(
 
 
 @pytest.mark.parametrize("invalid_reference_index", [0, 1])
+@pytest.mark.parametrize(
+    "reference_size,error_message",
+    [((65, 32), "divisible by 32"), ((160032, 32), "160000"), ((32, 160032), "160000")],
+)
 def test_reference_validation_matches_preprocessing(
-    encoded_image: str, invalid_reference_index: int
+    encoded_image: str,
+    invalid_reference_index: int,
+    reference_size: tuple[int, int],
+    error_message: str,
 ) -> None:
-    """TP preflight accepted an unaligned reference after the first image."""
+    """TP preflight accepted references that overflowed the patch grid or position cache."""
     image_buffer = io.BytesIO()
-    Image.new("RGB", (65, 32)).save(image_buffer, format="PNG")
+    Image.new("RGB", reference_size).save(image_buffer, format="PNG")
     references = [encoded_image, encoded_image]
     references[invalid_reference_index] = base64.b64encode(
         image_buffer.getvalue()
     ).decode("ascii")
     sampling = SenseNovaU1ImageEditSampling.from_params({"do_resize": False})
     for preprocess in (resolve_reference_output_size, prepare_reference_images):
-        with pytest.raises(ValueError, match="divisible by 32"):
+        with pytest.raises(ValueError, match=error_message):
             preprocess(references, sampling)
 
 

@@ -7,6 +7,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
+from transformers.utils.generic import merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
 
 from sglang_omni.models.sensenova_u1.cache_dit import (
     decoder_attention_type,
@@ -20,10 +22,6 @@ from sglang_omni.models.sensenova_u1.neo_unify.qwen_attention import Qwen3Attent
 from sglang_omni.models.sensenova_u1.neo_unify.qwen_feed_forward import (
     SenseNovaRMSNorm,
     make_qwen3_rms_norm,
-)
-from sglang_omni.models.sensenova_u1.neo_unify.transformers_compat import (
-    model_input_compat,
-    tied_weights_keys,
 )
 
 # Modified for SGLang; see this directory's README.md for upstream source.
@@ -74,7 +72,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         self.post_init()
 
-    @model_input_compat
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -174,9 +173,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
 
 class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
-    _tied_weights_keys = tied_weights_keys(
-        "lm_head.weight", "model.embed_tokens.weight"
-    )
+    _tied_weights_keys: dict[str, str] = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan: dict[str, str] = {"lm_head": "colwise_rep"}
     _pp_plan: dict[str, tuple[list[str], list[str]]] = {
         "lm_head": (["hidden_states"], ["logits"])

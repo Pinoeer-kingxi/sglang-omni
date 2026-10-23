@@ -49,10 +49,18 @@ def resolve_generation_parameters(
 
 
 IMAGE_DIMENSION_MULTIPLE = 32
+# note (Wes): Supported vision checkpoints cache 10,000 positions per axis at 16 pixels per patch.
+MAX_IMAGE_DIMENSION_PIXELS = 160000
 MIN_INPUT_MAX_PIXELS = 512 * 512
 
 ImageDimension = Annotated[
-    int, Field(gt=0, multiple_of=IMAGE_DIMENSION_MULTIPLE, strict=True)
+    int,
+    Field(
+        gt=0,
+        le=MAX_IMAGE_DIMENSION_PIXELS,
+        multiple_of=IMAGE_DIMENSION_MULTIPLE,
+        strict=True,
+    ),
 ]
 ImageCount = Annotated[int, Field(ge=1, le=10, strict=True)]
 GenerationSeed = Annotated[int, Field(ge=0, strict=True)]

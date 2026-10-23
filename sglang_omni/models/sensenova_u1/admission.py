@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 from sglang_omni.models.sensenova_u1.image_processing import (
     reference_image_size,
     resolve_edit_output_size,
+    validate_image_dimensions,
 )
 from sglang_omni.models.sensenova_u1.sampling import (
     SenseNovaU1ImageEditSampling,
@@ -134,6 +135,7 @@ def validate_admission(
         raise ValueError(
             "SenseNova UMM supports a text prompt or an image_edit request"
         )
+    validate_image_dimensions(output_width, output_height)
     if expected_images > limits.max_images:
         raise ValueError("SenseNova output count exceeds max_images")
     elif output_width * output_height * expected_images > limits.max_output_pixels:
@@ -155,6 +157,7 @@ def validate_admission(
 
 
 def validate_output_dimensions(request: OmniRequest, width: int, height: int) -> None:
+    validate_image_dimensions(width, height)
     configured_limits = request.metadata.get(ADMISSION_METADATA_KEY)
     if configured_limits is None:
         return

@@ -4,7 +4,6 @@
 import base64
 import importlib
 import io
-import pickle
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -15,8 +14,47 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang_omni.models.sensenova_u1.image_processing import prepare_reference_images
+from sglang_omni.models.sensenova_u1.image_processing import (
+    prepare_reference_images,
+    reference_image_size,
+)
 from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P", "P_alpha", "RGB", "L"])
+def test_transparent_references_are_composited_on_white(mode: str) -> None:
+    """Palette and grayscale PNG transparency was discarded instead of composited."""
+    image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    image.putpixel((0, 0), (64, 64, 64, 255))
+    image.putpixel((1, 1), (128, 128, 128, 128))
+    if mode in ("P", "P_alpha"):
+        image = image.convert("RGB").quantize(colors=3)
+        if mode == "P_alpha":
+            alpha_values = bytearray([255] * 256)
+            alpha_values[image.getpixel((1, 0))] = 0
+            alpha_values[image.getpixel((1, 1))] = 128
+            image.info["transparency"] = bytes(alpha_values)
+        else:
+            image.info["transparency"] = image.getpixel((1, 0))
+    elif mode in ("RGB", "L"):
+        image = image.convert(mode)
+        image.info["transparency"] = (0, 0, 0) if mode == "RGB" else 0
+    else:
+        image = image.convert(mode)
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, format="PNG")
+    prepared = prepare_reference_images(
+        base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+        SenseNovaU1ImageEditSampling.from_params({"do_resize": False}),
+    )
+    try:
+        assert prepared[0].mode == "RGB"
+        assert prepared[0].getpixel((1, 0)) == (255, 255, 255)
+        assert prepared[0].getpixel((0, 0)) == (64, 64, 64)
+        expected_gray = 191 if mode in ("RGBA", "LA", "P_alpha") else 128
+        assert prepared[0].getpixel((1, 1)) == (expected_gray,) * 3
+    finally:
+        prepared[0].close()
 
 
 class NativeModuleLoader(Protocol):
@@ -45,6 +83,31 @@ def native_modules(monkeypatch: pytest.MonkeyPatch) -> Iterator[NativeModuleLoad
                 pass
 
 
+@pytest.mark.parametrize("is_portrait", [False, True])
+def test_reference_axis_bound_matches_vision_positions(
+    native_modules: NativeModuleLoader, is_portrait: bool
+) -> None:
+    """The last admitted patch must fit the model's actual rotary position cache."""
+    vision = native_modules("modeling_neo_vit")
+    configuration = vision.NEOVisionConfig(hidden_size=8, llm_hidden_size=8)
+    embeddings = vision.NEOVisionEmbeddings(configuration)
+    embeddings.ensure_rotary_embedding_cache(torch.device("cpu"))
+    long_edge_pixels = (
+        configuration.patch_size * configuration.max_position_embeddings_vision
+    )
+    width, height = (32, long_edge_pixels) if is_portrait else (long_edge_pixels, 32)
+    sampling = SenseNovaU1ImageEditSampling.from_params({"do_resize": False})
+    assert reference_image_size(width, height, 1, sampling) == (width, height)
+    grid = torch.tensor(
+        [[height // configuration.patch_size, width // configuration.patch_size]]
+    )
+    patch_embeddings = torch.ones(int(grid.prod()), configuration.hidden_size)
+    outputs = embeddings.apply_2d_rotary_position_embeddings(patch_embeddings, grid)
+    assert torch.isfinite(outputs).all()
+    with pytest.raises(ValueError, match="pixels per axis"):
+        reference_image_size(width * 2, height * 2, 1, sampling)
+
+
 def test_moe_config_detects_expert_count_without_model_type(
     native_modules: NativeModuleLoader,
 ) -> None:
@@ -57,17 +120,10 @@ def test_moe_config_detects_expert_count_without_model_type(
     assert not module.is_moe_llm_config({"num_experts": 1})
 
 
-def test_model_input_compat_is_available_on_installed_transformers(
-    native_modules: NativeModuleLoader,
-) -> None:
-    module = native_modules("transformers_compat")
-    assert callable(module.model_input_compat)
-
-
 def test_deep_flow_head_constructs_and_accepts_timesteps(
     native_modules: NativeModuleLoader,
 ) -> None:
-    module = native_modules("modeling_fm_modules")
+    module = native_modules("flow_matching")
     head = module.FlowMatchingHead(8, 12, dim=16, layers=3, mlp_ratio=2).eval()
     with torch.inference_mode():
         outputs = head(torch.randn(5, 8), torch.linspace(0, 1, 5))
@@ -92,7 +148,7 @@ def test_vision_config_normalizes_checkpoint_dimensions(
 
 
 def test_flow_head_state_dict_round_trip(native_modules: NativeModuleLoader) -> None:
-    module = native_modules("modeling_fm_modules")
+    module = native_modules("flow_matching")
     original = module.FlowMatchingHead(8, 12, dim=16, layers=3, mlp_ratio=2).eval()
     restored = module.FlowMatchingHead(8, 12, dim=16, layers=3, mlp_ratio=2).eval()
     restored.load_state_dict(original.state_dict(), strict=True)
@@ -179,27 +235,6 @@ def test_conversation_preserves_image_message_and_registration_contract(
         "replacement system prompt"
         in conversations.get_conv_template(template.name).get_prompt()
     )
-
-
-@pytest.mark.parametrize(
-    ("legacy_name", "canonical_name"),
-    [
-        ("PatchDecoder_postps", "PatchDecoderPostPixelShuffle"),
-        ("PatchDecoder_preps", "PatchDecoderPrePixelShuffle"),
-        ("PatchDecoder_preps1", "PatchDecoderPrePixelShuffleSingleProjection"),
-    ],
-)
-def test_legacy_decoder_import_and_pickle_contract(
-    native_modules: NativeModuleLoader, legacy_name: str, canonical_name: str
-) -> None:
-    exports = native_modules("modeling_fm_modules")
-    decoders = native_modules("image_decoders")
-    legacy_class = getattr(exports, legacy_name)
-    assert legacy_class is getattr(decoders, canonical_name)
-    assert legacy_class is getattr(decoders, legacy_name)
-    assert pickle.loads(pickle.dumps(legacy_class)) is legacy_class
-    historical_pickle = f"c{exports.__name__}\n{legacy_name}\n.".encode("ascii")
-    assert pickle.loads(historical_pickle) is legacy_class
 
 
 @pytest.mark.parametrize("ratio", [0.5, [0.5], [[0.5]], [[[0.5]]], (0.5,)])

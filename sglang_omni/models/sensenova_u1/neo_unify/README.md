@@ -10,3 +10,8 @@ They were modified for SGLang multimodal_gen native integration.
 For SGLang-Omni, the platform import was changed. The pipeline runs native
 T2I and I2I only; thinking, interleaved output, and SRT KV transfer are not
 included.
+
+The implementation requires the Transformers version pinned in `pyproject.toml`.
+Checkpoints load through registered `AutoModel` classes and tensor state
+dictionaries. Legacy Python import aliases and pickled model objects are outside
+the supported checkpoint format.

@@ -22,6 +22,8 @@ from sglang_omni.models.sensenova_u1.sampling import (
     resolve_cache_dit_defaults,
     resolve_cache_dit_params,
 )
+from sglang_omni.pipeline.umm import UMMRequestError
+from sglang_omni.serve.openai_errors import generation_error_status_code
 
 
 class TestCacheDitParameters(unittest.TestCase):
@@ -174,16 +176,21 @@ class TestCacheDitLifecycle(unittest.TestCase):
         )
 
     def test_block_counts_use_backend_defaults(self) -> None:
+        """Out-of-range cache block counts returned 500 instead of a request error."""
         for params in (
             {"Bn_compute_blocks": 25},
             {"Fn_compute_blocks": 31, "Bn_compute_blocks": 2},
             {"Fn_compute_blocks": 33},
         ):
-            with (
-                self.subTest(params=params),
-                self.assertRaisesRegex(ValueError, "decoder layer count"),
-            ):
-                self.prepare(params=params)
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(
+                    UMMRequestError, "decoder layer count"
+                ) as raised:
+                    self.prepare(params=params)
+                self.assertEqual(
+                    generation_error_status_code(RuntimeError(str(raised.exception))),
+                    400,
+                )
         self.backend.enable_cache.assert_not_called()
         for params in (
             {"Bn_compute_blocks": 24},
@@ -199,10 +206,13 @@ class TestCacheDitLifecycle(unittest.TestCase):
         self.prepare()
         adapter = self.controller.adapter
         layers = self.transformer.layers
-        with self.assertRaisesRegex(ValueError, "decoder layer count"):
+        with self.assertRaisesRegex(UMMRequestError, "decoder layer count") as raised:
             self.controller.validate_request(
                 self.transformer, params={"Fn_compute_blocks": 33}, steps=30
             )
+        self.assertEqual(
+            generation_error_status_code(RuntimeError(str(raised.exception))), 400
+        )
         self.assertIs(self.controller.adapter, adapter)
         self.assertIs(self.transformer.layers, layers)
         self.backend.disable_cache.assert_not_called()

@@ -8,7 +8,6 @@ from torch import nn
 from transformers import Qwen3Config
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils.deprecation import deprecate_kwarg
 
@@ -16,9 +15,7 @@ from sglang_omni.models.sensenova_u1.neo_unify.attention_backend import (
     position_ids_from_indexes,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.attention_ops import (
-    AttentionForward,
     eager_attention_forward,
-    repeat_kv,
 )
 from sglang_omni.models.sensenova_u1.neo_unify.generation_attention import (
     forward_gen as generation_attention,
@@ -36,7 +33,7 @@ from sglang_omni.models.sensenova_u1.neo_unify.rotary_embeddings import (
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 
-__all__ = ["Qwen3Attention", "AttentionForward", "eager_attention_forward", "repeat_kv"]
+__all__ = ["Qwen3Attention"]
 
 
 class Qwen3Attention(nn.Module):
@@ -240,18 +237,7 @@ class Qwen3Attention(nn.Module):
         else:
             pass
 
-        attention_interface: AttentionForward = eager_attention_forward
-        if (
-            self.config._attn_implementation
-            != "eager"  # noqa: leading-underscore -- Transformers attention backend field
-        ):
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation  # noqa: leading-underscore -- Transformers attention backend field
-            ]
-        else:
-            pass
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = eager_attention_forward(
             self,
             query_states,
             key_states,

@@ -13,12 +13,22 @@ from PIL import Image
 
 from sglang_omni.models.sensenova_u1.sampling import (
     IMAGE_DIMENSION_MULTIPLE,
+    MAX_IMAGE_DIMENSION_PIXELS,
     MIN_INPUT_MAX_PIXELS,
     SenseNovaU1ImageEditSampling,
 )
 from sglang_omni.proto.request import StagePayload
 
 DEFAULT_INPUT_MAX_PIXELS = 2048 * 2048
+
+
+def validate_image_dimensions(width_pixels: int, height_pixels: int) -> None:
+    if max(width_pixels, height_pixels) > MAX_IMAGE_DIMENSION_PIXELS:
+        raise ValueError(
+            f"SenseNova image dimensions must not exceed {MAX_IMAGE_DIMENSION_PIXELS} pixels per axis"
+        )
+    else:
+        pass
 
 
 def smart_resize(
@@ -62,6 +72,7 @@ def reference_image_size(
                 f"Unresized reference dimensions must be divisible by {IMAGE_DIMENSION_MULTIPLE}"
             )
         else:
+            validate_image_dimensions(width, height)
             return width, height
     elif options.input_max_pixels is not None:
         input_max_pixels = options.input_max_pixels
@@ -78,6 +89,7 @@ def reference_image_size(
         min_pixels=input_max_pixels,
         max_pixels=input_max_pixels,
     )
+    validate_image_dimensions(resized_width, resized_height)
     return resized_width, resized_height
 
 
@@ -116,9 +128,10 @@ def prepare_reference_images(
     prepared: list[Image.Image] = []
     try:
         for image in images:
-            if image.mode == "RGBA":
+            if "A" in image.getbands() or "transparency" in image.info:
+                image = image.convert("RGBA")
                 background = Image.new("RGB", image.size, (255, 255, 255))
-                background.paste(image, mask=image.split()[3])
+                background.paste(image, mask=image.getchannel("A"))
                 image = background
             else:
                 image = image.convert("RGB")

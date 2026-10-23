@@ -18,6 +18,7 @@ except ModuleNotFoundError as exc:
         cache_dit = None
 
 from sglang_omni.models.sensenova_u1.sampling import resolve_cache_dit_params
+from sglang_omni.pipeline.umm import UMMRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,12 @@ class SenseNovaCacheDit:
         steps: int,
     ) -> tuple[cache_dit.DBCacheConfig, dict[str, int | float]]:
         """Validate effective settings without changing cache or model state."""
-        _, request_params = resolve_cache_dit_params(
-            {"enable_cache_dit": True, "cache_dit_params": params}, True
-        )
+        try:
+            _, request_params = resolve_cache_dit_params(
+                {"enable_cache_dit": True, "cache_dit_params": params}, True
+            )
+        except ValueError as error:
+            raise UMMRequestError(str(error)) from error
         _, effective_params = resolve_cache_dit_params(
             {"cache_dit_params": self.default_params | (request_params or {})}, True
         )
@@ -119,7 +123,7 @@ class SenseNovaCacheDit:
             config.Fn_compute_blocks + config.Bn_compute_blocks
             > transformer.config.num_hidden_layers
         ):
-            raise ValueError(
+            raise UMMRequestError(
                 "SenseNova Cache-DiT Fn_compute_blocks and Bn_compute_blocks "
                 "must not exceed the decoder layer count"
             )
