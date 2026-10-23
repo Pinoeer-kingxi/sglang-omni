@@ -37,11 +37,6 @@ from sglang_omni.models.sensenova_u1.image_processing import (
 from sglang_omni.models.sensenova_u1.images_api import register_images_api
 from sglang_omni.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
 from sglang_omni.models.sensenova_u1.sampling import SenseNovaU1ImageEditSampling
-from sglang_omni.models.sensenova_u1.stages import (
-    image_generation_batch_key,
-    image_generation_request_cost,
-    validate_generation_request,
-)
 from sglang_omni.models.sensenova_u1.tensor_parallel import (
     SenseNovaTensorParallelScheduler,
 )
@@ -275,7 +270,7 @@ def test_image_generation_request_cost_counts_pixels_steps_and_cfg():
         data=None,
     )
 
-    assert image_generation_request_cost(payload) == 64 * 32 * 12 * 2
+    assert stages_module.image_generation_request_cost(payload) == 64 * 32 * 12 * 2
 
 
 def test_image_generation_batch_key_separates_parameters_and_image_edits():
@@ -291,9 +286,13 @@ def test_image_generation_batch_key_separates_parameters_and_image_edits():
     different = payload("different", "a dog", width=32, height=32, seed=19)
     edit = payload("edit", {"task": "image_edit"})
 
-    assert image_generation_batch_key(first) == image_generation_batch_key(same)
-    assert image_generation_batch_key(first) != image_generation_batch_key(different)
-    assert image_generation_batch_key(edit) == ("image_edit", "edit")
+    assert stages_module.image_generation_batch_key(
+        first
+    ) == stages_module.image_generation_batch_key(same)
+    assert stages_module.image_generation_batch_key(
+        first
+    ) != stages_module.image_generation_batch_key(different)
+    assert stages_module.image_generation_batch_key(edit) == ("image_edit", "edit")
 
 
 def test_i2i_stage_decodes_reference_and_passes_source_arguments(
@@ -918,9 +917,12 @@ def test_i2i_stage_overrides_match_cost_and_tp_validation(
         (1, 3, output_height_pixels, output_width_pixels)
     )
     with patch.object(Image, "open", wraps=Image.open) as open_image:
-        assert image_generation_request_cost(payload) == 96 * 64 * 4 * branch_count
+        assert (
+            stages_module.image_generation_request_cost(payload)
+            == 96 * 64 * 4 * branch_count
+        )
     open_image.assert_not_called()
-    validate_generation_request(payload, model, cache_dit)
+    stages_module.validate_generation_request(payload, model, cache_dit)
     assert cache_dit.validate_request.call_args.kwargs["steps"] == 4
     result = generation_module.generate_image(payload, model, tokenizer, cache_dit)
     assert cache_dit.prepare.call_args.kwargs["steps"] == 4
@@ -988,7 +990,7 @@ def test_i2i_validation_decodes_references_without_resizing(
             output_width_pixels,
             output_height_pixels,
         )
-        validate_generation_request(payload, model, cache_dit)
+        stages_module.validate_generation_request(payload, model, cache_dit)
     load.assert_called()
     resize.assert_not_called()
 
@@ -1045,7 +1047,7 @@ async def test_truncated_image_is_rejected_before_tp_fanout(
         return generation_module.generate_image(payload, model, tokenizer, cache_dit)
 
     def validate(payload: StagePayload) -> None:
-        validate_generation_request(payload, model, cache_dit)
+        stages_module.validate_generation_request(payload, model, cache_dit)
 
     scheduler = (
         SenseNovaTensorParallelScheduler(
@@ -1117,7 +1119,7 @@ def test_invalid_edit_seed_is_rejected_before_tp_execution(
     )
     model = Mock()
     with pytest.raises(ValueError, match="seed"):
-        validate_generation_request(payload, model, cache_dit)
+        stages_module.validate_generation_request(payload, model, cache_dit)
     with pytest.raises(ValueError, match="seed"):
         generation_module.generate_image(payload, model, tokenizer, cache_dit)
     it2i_generate_mock.assert_not_called()
@@ -1221,8 +1223,8 @@ def test_image_edits_stay_single_item_without_decoding_cost() -> None:
         batch_compute_fn=Mock(),
         max_batch_size=2,
         max_batch_cost=1,
-        batch_key_fn=image_generation_batch_key,
-        request_cost_fn=image_generation_request_cost,
+        batch_key_fn=stages_module.image_generation_batch_key,
+        request_cost_fn=stages_module.image_generation_request_cost,
     )
     messages = [
         IncomingMessage(

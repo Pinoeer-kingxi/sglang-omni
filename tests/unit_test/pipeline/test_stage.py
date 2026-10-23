@@ -135,7 +135,7 @@ def test_tp_validation_runs_off_the_event_loop():
         assert await asyncio.to_thread(entered.wait, 2)
         # The loop can only reach this line while validation is still blocked.
         release.set()
-        await execution
+        await asyncio.wait_for(execution, timeout=2)
 
     asyncio.run(dispatch())
     assert scheduler.inbox.get_nowait().request_id == "req-1"
@@ -161,7 +161,7 @@ def test_abort_during_tp_validation_skips_dispatch():
         assert await asyncio.to_thread(entered.wait, 2)
         leader.on_abort("req-1")
         release.set()
-        await execution
+        await asyncio.wait_for(execution, timeout=2)
 
     asyncio.run(dispatch())
     fanout.fanout_work.assert_not_called()
