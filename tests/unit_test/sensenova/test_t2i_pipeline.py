@@ -15,6 +15,7 @@ from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
 import sglang_omni.models.sensenova_u1.generation as generation_module
+import sglang_omni.models.sensenova_u1.stages as stages_module
 from sglang_omni.client.image_media import InlineImage
 from sglang_omni.client.types import (
     GenerateChunk,
@@ -772,6 +773,80 @@ def test_image_edit_oom_uses_model_device_backend(
         assert ("dit_layerwise_resident_layers" in str(raised.value)) is (
             device_type == "cuda"
         )
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_generation_runs_no_checkpoint_after_the_model_returns(
+    monkeypatch: pytest.MonkeyPatch, batched: bool
+) -> None:
+    """A cancellation check after the model returned discarded finished images and cost every TP request one more collective."""
+    events: list[str] = []
+
+    def generate(
+        payload: StagePayload,
+        model: NEOChatModel,
+        tokenizer: PreTrainedTokenizerBase,
+        cache_dit: SenseNovaCacheDit,
+    ) -> StagePayload:
+        events.append("model")
+        return payload
+
+    def generate_batch(
+        payloads: list[StagePayload],
+        model: NEOChatModel,
+        tokenizer: PreTrainedTokenizerBase,
+        cache_dit: SenseNovaCacheDit,
+    ) -> list[StagePayload]:
+        events.append("model")
+        return payloads
+
+    model = Mock()
+    model.eval.return_value = model
+    model.to.return_value = model
+    monkeypatch.setattr(
+        stages_module, "generation_checkpoint", lambda: events.append("checkpoint")
+    )
+    monkeypatch.setattr(stages_module, "generate_image", generate)
+    monkeypatch.setattr(stages_module, "generate_images", generate_batch)
+    monkeypatch.setattr(stages_module, "register", lambda: None)
+    monkeypatch.setattr(
+        stages_module,
+        "AutoTokenizer",
+        SimpleNamespace(from_pretrained=lambda model_path: Mock()),
+    )
+    monkeypatch.setattr(
+        stages_module,
+        "AutoModel",
+        SimpleNamespace(from_pretrained=lambda model_path, torch_dtype: model),
+    )
+    monkeypatch.setattr(
+        stages_module,
+        "resolve_concrete_device",
+        lambda device, gpu_id: torch.device("cpu"),
+    )
+    scheduler = stages_module.create_generation_executor(
+        "/model/sensenova",
+        dtype="bfloat16",
+        cooperative_cancellation=True,
+        max_batch_size=2,
+        enable_cache_dit=False,
+        dit_layerwise_offload=False,
+        dit_offload_prefetch_size=1,
+        dit_layerwise_resident_layers=0,
+        dit_layerwise_residency_policy="leading",
+        pin_cpu_memory=False,
+    )
+    payloads = [
+        StagePayload(f"request-{index}", OmniRequest("a cat", {}), None)
+        for index in range(2)
+    ]
+
+    if batched:
+        assert scheduler.batch_fn(payloads) == payloads
+    else:
+        assert scheduler.fn(payloads[0]) is payloads[0]
+
+    assert events == ["checkpoint", "model"]
 
 
 def test_multi_output_failure_cleans_cache_controller(

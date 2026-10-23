@@ -64,7 +64,7 @@ def validate_admission(
         and inputs["prompt"].strip()
     ):
         options = SenseNovaU1ImageEditSampling.from_params(parameters)
-        expected_images = 1
+        expected_images = options.n
         output_width, output_height = options.width, options.height
         references = inputs.get("image_b64")
         if isinstance(references, str):

@@ -115,6 +115,29 @@ def test_invalid_request_never_dispatches(
     assert not controller.adapter.executions
 
 
+def test_generate_edit_with_several_outputs_names_the_images_api(
+    controller: UMMController, encoded_image: str
+) -> None:
+    """A /generate edit with n above 1 was rejected with only a bare pydantic bound."""
+    with pytest.raises(UMMRequestError, match="/v1/images/edits"):
+        controller.transition(
+            StagePayload(
+                "request",
+                OmniRequest(
+                    {
+                        "task": "image_edit",
+                        "prompt": "edit",
+                        "image_b64": encoded_image,
+                    },
+                    {"n": 2},
+                ),
+                None,
+            )
+        )
+    assert not controller.contexts
+    assert not controller.adapter.executions
+
+
 @pytest.mark.parametrize("is_image_edit", [False, True])
 def test_seed_overflow_never_dispatches(
     controller: UMMController, encoded_image: str, is_image_edit: bool

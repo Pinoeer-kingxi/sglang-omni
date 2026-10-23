@@ -6,7 +6,15 @@ from __future__ import annotations
 import json
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictInt,
+    field_validator,
+)
 
 MAX_GENERATION_SEED = 2**64 - 1
 
@@ -103,13 +111,24 @@ class SenseNovaU1Sampling(BaseModel):
 class SenseNovaU1ImageEditSampling(SenseNovaU1Sampling):
     """Image editing runs one output per request; the Images API sends one request per output."""
 
-    n: Annotated[int, Field(ge=1, le=1, strict=True)] = 1
+    n: StrictInt = 1
     img_cfg_scale: GuidanceScale = 1.0
     input_max_pixels: (
         Annotated[int, Field(ge=MIN_INPUT_MAX_PIXELS, strict=True)] | None
     ) = None
     do_resize: StrictBool = True
     size_explicit: StrictBool = False
+
+    @field_validator("n")
+    @classmethod
+    def validate_single_output(cls, n: int) -> int:
+        if n != 1:
+            raise ValueError(
+                "SenseNova-U1 image edits produce one image per request; "
+                "use n on /v1/images/edits or send one request per seed"
+            )
+        else:
+            return n
 
 
 CACHE_DIT_PARAMETER_NAMES = frozenset(

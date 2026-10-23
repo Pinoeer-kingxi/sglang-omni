@@ -155,7 +155,7 @@ def test_image_only_matches_all_true_indicators():
 
 
 def test_denoising_embeds_each_timestep_once_per_step(monkeypatch):
-    """CUDA denoising ran the timestep embedder on every image token at every step."""
+    """CUDA denoising embedded every image token at every step; each step must still add its own timestep's embedding."""
     embedded_timestep_counts: list[int] = []
 
     class RecordingTimestepEmbedder(nn.Module):
@@ -187,13 +187,15 @@ def test_denoising_embeds_each_timestep_once_per_step(monkeypatch):
         image_indexes=torch.zeros(3, 64, dtype=torch.long),
         token_lengths=torch.tensor([3]),
     )
-    monkeypatch.setattr(
-        image_denoise,
-        "t2i_predict_v",
-        lambda model, embeddings, indexes, mask, cache, timestep, latents, **kwargs: (
-            torch.zeros_like(latents)
-        ),
-    )
+    predictor_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def predict_velocity(
+        model, embeddings, indexes, mask, cache, timestep, latents, **kwargs
+    ):
+        predictor_inputs.append((embeddings, timestep))
+        return torch.zeros_like(latents)
+
+    monkeypatch.setattr(image_denoise, "t2i_predict_v", predict_velocity)
     sampling = SenseNovaU1Sampling.from_params(
         {"width": 32, "height": 32, "num_inference_steps": 3, "guidance_scale": 1.0}
     )
@@ -204,3 +206,8 @@ def test_denoising_embeds_each_timestep_once_per_step(monkeypatch):
 
     assert images.shape == (2, 3, 32, 32)
     assert embedded_timestep_counts == [3]
+    assert len(predictor_inputs) == 3
+    for embeddings, timestep in predictor_inputs:
+        torch.testing.assert_close(
+            embeddings, timestep.expand_as(embeddings), rtol=0, atol=0
+        )
