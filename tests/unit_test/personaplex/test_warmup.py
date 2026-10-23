@@ -176,6 +176,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     assert scheduler.req_to_token_pool.owned_rows == {99}
 
 
+@pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fail_step", [None, 2])
 def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
@@ -206,9 +207,12 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
