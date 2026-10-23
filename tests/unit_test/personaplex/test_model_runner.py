@@ -787,9 +787,12 @@ def test_prefill_from_a_cached_prefix_embeds_only_the_missing_rows(cached: str):
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
