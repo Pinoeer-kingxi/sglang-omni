@@ -3,7 +3,7 @@
 
 import logging
 import time
-from itertools import product
+from dataclasses import replace
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -38,20 +38,14 @@ class PersonaPlexSessionScheduler(OmniScheduler[SGLangARRequestData]):
         caller_codes = torch.tensor(SILENCE_CODES).repeat(WARMUP_FRAMES, 1)
         rng_devices = [device.index or 0] if device.type != "cpu" else []
         with torch.random.fork_rng(devices=rng_devices, device_type=device.type):
-            for batch_size, sampling_seed in product(
-                range(1, max_batch_size + 1), (None, 0)
-            ):
+            for batch_size in range(1, max_batch_size + 1):
                 requests: list[SchedulerRequest] = []
                 try:
                     for index in range(batch_size):
-                        request_id = (
-                            f"personaplex-warmup-{batch_size}-{sampling_seed}-{index}"
-                        )
+                        request_id = f"personaplex-warmup-{batch_size}-{index}"
                         payload = StagePayload(
                             request_id,
-                            request=OmniRequest(
-                                inputs=None, params={"seed": sampling_seed}
-                            ),
+                            request=OmniRequest(inputs=None),
                             data=PersonaPlexState(
                                 user_codes=caller_codes,
                             ).to_dict(),
@@ -68,8 +62,15 @@ class PersonaPlexSessionScheduler(OmniScheduler[SGLangARRequestData]):
                             SchedulerRequest(request_id=request_id, data=request_data)
                         )
 
-                    for step in range(WARMUP_FRAMES):
+                    # Note (edwardzh): Both paths sample [batch_size, vocabulary] logits, so each seed mode needs only one forward.
+                    for step, sampling_seed in enumerate((None, 0)):
                         for request in requests:
+                            inputs = request.data.talker_model_inputs
+                            sampling = replace(inputs["sampling"], seed=sampling_seed)
+                            inputs["sampling"] = sampling
+                            request.data.req.sampling_params.sampling_seed = (
+                                sampling.text_seed
+                            )
                             request.data.req.init_next_round_input()
                             request.data.req.extend_end = request.data.req.seqlen
                         batch = ScheduleBatch.init_new(

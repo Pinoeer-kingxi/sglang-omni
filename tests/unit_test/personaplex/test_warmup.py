@@ -1,23 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup warmup owns temporary allocations and must fail before readiness."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode
+from torch._dynamo import reset
+from torch._dynamo.utils import counters
 
 import sglang_omni.models.personaplex.warmup as warmup_module
+from sglang_omni.models.personaplex.architecture import (
+    DEFAULT_AUDIO_TEMPERATURE,
+    DEFAULT_AUDIO_TOP_K,
+)
+from sglang_omni.models.personaplex.engine_builder import (
+    PersonaPlexSessionEngineBuilder,
+)
+from sglang_omni.models.personaplex.prompts import load_text_tokenizer
+from sglang_omni.models.personaplex.sampling import AudioSampling
 from sglang_omni.models.personaplex.warmup import PersonaPlexSessionScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
-WARMUP_BATCH_SIZES = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+WARMUP_BATCH_SIZES = [1, 1, 2, 2, 3, 3]
 
 
 class WarmupRequestPool:
@@ -46,6 +67,10 @@ class WarmupRunner:
         self.grad_modes = []
 
     def execute(self, output) -> ModelRunnerOutput:
+        for request in output.requests:
+            assert request.data.req.sampling_params.sampling_seed == (
+                request.data.talker_model_inputs["sampling"].text_seed
+            )
         self.grad_modes.append(
             (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
         )
@@ -134,8 +159,6 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
     assert [len(call) for call in runner.calls] == WARMUP_BATCH_SIZES
     assert [{seed for _, _, seed in call} for call in runner.calls] == [
         {None},
-        {None},
-        {0},
         {0},
     ] * 3
     for prompt_call, extend_call in zip(
@@ -145,13 +168,13 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
         assert all(prefix > 0 and rows == 1 for prefix, rows, _ in extend_call)
     assert torch.equal(torch.random.get_rng_state(), original_rng_state)
     assert scheduler.req_to_token_pool.owned_rows == {99}
-    assert len(scheduler.req_to_token_pool.freed_rows) == 12
+    assert len(scheduler.req_to_token_pool.freed_rows) == 6
     assert all(
         not request.kv.holds_kv for requests in preparations for request in requests
     )
 
 
-@pytest.mark.parametrize("fail_step", range(1, 13))
+@pytest.mark.parametrize("fail_step", range(1, 7))
 def test_forward_failure_releases_only_warmup_requests_and_restores_rng(
     warmup_backend, fail_step
 ):
@@ -184,7 +207,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     built_requests = []
 
     def build(payload, **arguments):
-        if len(built_requests) == 3:
+        if len(built_requests) == 2:
             raise RuntimeError("injected request initialization failure")
         request = original_builder(payload, **arguments)
         built_requests.append(request)
@@ -195,7 +218,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     scheduler.model_runner = runner
     with pytest.raises(RuntimeError, match="injected request initialization failure"):
         scheduler.warm_up_serving_thread()
-    assert len(runner.calls) == 4
+    assert len(runner.calls) == 2
     assert all(not request.req.kv.holds_kv for request in built_requests)
     assert scheduler.req_to_token_pool.owned_rows == {99}
 
@@ -253,7 +276,7 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     "fail_step,request_capacity,token_capacity,expected_error",
     [
         (None, 4, 128, None),
-        (8, 4, 128, "injected forward failure"),
+        (4, 4, 128, "injected forward failure"),
         (None, 4, 2, "Out of memory"),
         (None, 3, 128, "alloc_req_slots runs out of memory"),
     ],
@@ -311,3 +334,104 @@ def test_real_batch_preparation_returns_request_and_token_capacity(
         assert foreign_rows[0] not in request_pool.free_slots
         assert request_pool.req_to_token[foreign_rows[0], 0] == foreign_tokens[0]
         assert cache.session.slots == {}
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_reduced_warmup_leaves_no_cold_sampling_combination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first seeded prompt must not compile a path omitted by reduced warmup."""
+    checkpoint_path = os.environ.get("PERSONAPLEX_PARITY_CHECKPOINT")
+    if checkpoint_path is None:
+        pytest.skip("Set PERSONAPLEX_PARITY_CHECKPOINT for real-model warmup coverage")
+    else:
+        pass
+    builder = PersonaPlexSessionEngineBuilder(
+        tokenizer=load_text_tokenizer(checkpoint_path),
+        enable_async_decode=False,
+        depformer_cuda_graph_batch_sizes=[1, 2, 4],
+        depformer_cuda_graph_sampling=AudioSampling(
+            DEFAULT_AUDIO_TEMPERATURE, DEFAULT_AUDIO_TOP_K
+        ),
+    )
+    scheduler = builder.build(
+        checkpoint_path,
+        device="cuda",
+        gpu_id=0,
+        dtype="bfloat16",
+        server_args_overrides={
+            "max_running_requests": 3,
+            "cuda_graph_max_bs": 3,
+            "cuda_graph_bs": [1, 2, 3],
+            "mem_fraction_static": 0.65,
+        },
+    )
+    original_init = ScheduleBatch.init_new
+    seen_combinations: set[tuple[int, int | None, bool]] = set()
+    sampling_seed: int | None = None
+
+    def prepare_sampling_batch(
+        *,
+        reqs: list[Req],
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
+    ) -> ScheduleBatch:
+        for request in reqs:
+            inputs = request.omni_data.talker_model_inputs
+            sampling = replace(inputs["sampling"], seed=sampling_seed)
+            inputs["sampling"] = sampling
+            request.sampling_params.sampling_seed = sampling.text_seed
+        seen_combinations.add((len(reqs), sampling_seed, reqs[0].prefix_len > 0))
+        return original_init(
+            reqs=reqs,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            model_config=model_config,
+            enable_overlap=enable_overlap,
+            spec_algorithm=spec_algorithm,
+        )
+
+    @DynamicGradMode()
+    def verify_coverage() -> None:
+        nonlocal sampling_seed
+        torch.cuda.set_device(0)
+        initial_capacity = (
+            scheduler.req_to_token_pool.available_size(),
+            scheduler.token_to_kv_pool_allocator.available_size(),
+        )
+        initial_cpu_rng = torch.get_rng_state()
+        initial_cuda_rng = torch.cuda.get_rng_state()
+        reset()
+        scheduler.warm_up_serving_thread()
+        compiled_before_probe = dict(counters["stats"])
+        with monkeypatch.context() as sampling_patch:
+            sampling_patch.setattr(ScheduleBatch, "init_new", prepare_sampling_batch)
+            for sampling_seed in (None, 0):
+                scheduler.warm_up_serving_thread()
+        torch.cuda.synchronize()
+        assert seen_combinations == {
+            (batch_size, seed, is_extend)
+            for batch_size in range(1, 4)
+            for seed in (None, 0)
+            for is_extend in (False, True)
+        }
+        assert dict(counters["stats"]) == compiled_before_probe
+        assert torch.equal(initial_cpu_rng, torch.get_rng_state())
+        assert torch.equal(initial_cuda_rng, torch.cuda.get_rng_state())
+        assert (
+            scheduler.req_to_token_pool.available_size(),
+            scheduler.token_to_kv_pool_allocator.available_size(),
+        ) == initial_capacity
+        assert scheduler.tree_cache.session.slots == {}
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(verify_coverage).result()
+    finally:
+        scheduler.stop()
