@@ -171,6 +171,14 @@ def test_session_codes_are_owned_before_text_completion(
     monkeypatch, frame_count, device
 ):
     """A completed unit must publish owned codes before its text completion fence."""
+    reference_runner = make_runner(FakeModel())
+    reference_request = make_request(frame_count)
+    generate(
+        reference_runner,
+        reference_request,
+        [77 + step for step in range(frame_count)],
+    )
+    expected = torch.stack(reference_request.data.talker_model_inputs["frames"])
     model = FakeModel()
     model.fusion_buffer = model.fusion_buffer.to(device)
     model.hidden_out = model.hidden_out.to(device)
@@ -213,22 +221,24 @@ def test_session_codes_are_owned_before_text_completion(
             assert runner.resolve_host_token_ids(result).tolist() == [77 + step]
             request.data.req.output_ids.append(77 + step)
     (codes,) = published
-    expected = codes.cpu().clone()
+    consumer = torch.cuda.Stream() if device == "cuda" else None
+    consumer_context = (
+        torch.cuda.stream(consumer) if consumer is not None else nullcontext()
+    )
+    with consumer_context:
+        consumed = codes.clone()
     monkeypatch.setattr(runner, "stage_token_ids", original_stage)
     next_request = make_request(1, request_id="next")
     prefill(runner, next_request, scheduled(next_request))
     next_result = SimpleNamespace(next_token_ids=torch.tensor([91], device=device))
     runner.post_prefill(next_result, None, None, [next_request])
     assert runner.resolve_host_token_ids(next_result).tolist() == [91]
-    if device == "cuda":
-        torch.cuda.current_stream().synchronize()
-        consumer = torch.cuda.Stream()
-        with torch.cuda.stream(consumer):
-            consumed = codes.clone()
+    if consumer is not None:
         consumer.synchronize()
     else:
-        consumed = codes.clone()
+        pass
     assert torch.equal(consumed.cpu(), expected)
+    assert torch.equal(codes.cpu(), expected)
 
 
 def test_prefill_uses_stored_voice_rows_and_embeds_the_rest():
