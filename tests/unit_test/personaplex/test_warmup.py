@@ -16,6 +16,8 @@ import sglang_omni.models.personaplex.warmup as warmup_module
 from sglang_omni.models.personaplex.warmup import PersonaPlexSessionScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
+WARMUP_BATCH_SIZES = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+
 
 class WarmupRequestPool:
     def __init__(self) -> None:
@@ -44,7 +46,11 @@ class WarmupRunner:
     def execute(self, output) -> ModelRunnerOutput:
         self.calls.append(
             [
-                (request.data.req.prefix_len, request.data.req.extend_len)
+                (
+                    request.data.req.prefix_len,
+                    request.data.req.extend_len,
+                    request.data.talker_model_inputs["sampling"].seed,
+                )
                 for request in output.requests
             ]
         )
@@ -112,21 +118,27 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
     scheduler.model_runner = runner
     original_rng_state = torch.random.get_rng_state()
     scheduler.warm_up_serving_thread()
-    assert [len(call) for call in runner.calls] == [1, 1, 2, 2, 3, 3]
+    assert [len(call) for call in runner.calls] == WARMUP_BATCH_SIZES
+    assert [{seed for _, _, seed in call} for call in runner.calls] == [
+        {None},
+        {None},
+        {0},
+        {0},
+    ] * 3
     for prompt_call, extend_call in zip(
         runner.calls[::2], runner.calls[1::2], strict=True
     ):
-        assert all(prefix == 0 and rows > 1 for prefix, rows in prompt_call)
-        assert all(prefix > 0 and rows == 1 for prefix, rows in extend_call)
+        assert all(prefix == 0 and rows > 1 for prefix, rows, _ in prompt_call)
+        assert all(prefix > 0 and rows == 1 for prefix, rows, _ in extend_call)
     assert torch.equal(torch.random.get_rng_state(), original_rng_state)
     assert scheduler.req_to_token_pool.owned_rows == {99}
-    assert len(scheduler.req_to_token_pool.freed_rows) == 6
+    assert len(scheduler.req_to_token_pool.freed_rows) == 12
     assert all(
         not request.kv.holds_kv for requests in preparations for request in requests
     )
 
 
-@pytest.mark.parametrize("fail_step", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("fail_step", range(1, 13))
 def test_forward_failure_releases_only_warmup_requests_and_restores_rng(
     warmup_backend, fail_step
 ):
@@ -159,7 +171,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     built_requests = []
 
     def build(payload, **arguments):
-        if len(built_requests) == 2:
+        if len(built_requests) == 3:
             raise RuntimeError("injected request initialization failure")
         request = original_builder(payload, **arguments)
         built_requests.append(request)
@@ -170,14 +182,14 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     scheduler.model_runner = runner
     with pytest.raises(RuntimeError, match="injected request initialization failure"):
         scheduler.warm_up_serving_thread()
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 4
     assert all(not request.req.kv.holds_kv for request in built_requests)
     assert scheduler.req_to_token_pool.owned_rows == {99}
 
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("fail_step", [None, 2])
+@pytest.mark.parametrize("fail_step", [None, 2, 4])
 def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     warmup_backend, monkeypatch, fail_step
 ):
@@ -228,7 +240,7 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     "fail_step,request_capacity,token_capacity,expected_error",
     [
         (None, 4, 128, None),
-        (4, 4, 128, "injected forward failure"),
+        (8, 4, 128, "injected forward failure"),
         (None, 4, 2, "Out of memory"),
         (None, 3, 128, "alloc_req_slots runs out of memory"),
     ],
@@ -274,7 +286,7 @@ def test_real_batch_preparation_returns_request_and_token_capacity(
         scheduler.model_runner = runner
         if expected_error is None:
             scheduler.warm_up_serving_thread()
-            assert [len(call) for call in runner.calls] == [1, 1, 2, 2, 3, 3]
+            assert [len(call) for call in runner.calls] == WARMUP_BATCH_SIZES
         else:
             with pytest.raises(RuntimeError, match=expected_error):
                 scheduler.warm_up_serving_thread()

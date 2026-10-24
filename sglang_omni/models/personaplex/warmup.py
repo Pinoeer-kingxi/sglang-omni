@@ -3,6 +3,7 @@
 
 import logging
 import time
+from itertools import product
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -36,14 +37,20 @@ class PersonaPlexSessionScheduler(OmniScheduler[SGLangARRequestData]):
         caller_codes = torch.tensor(SILENCE_CODES).repeat(WARMUP_FRAMES, 1)
         rng_devices = [device.index or 0] if device.type != "cpu" else []
         with torch.random.fork_rng(devices=rng_devices, device_type=device.type):
-            for batch_size in range(1, max_batch_size + 1):
+            for batch_size, sampling_seed in product(
+                range(1, max_batch_size + 1), (None, 0)
+            ):
                 requests: list[SchedulerRequest] = []
                 try:
                     for index in range(batch_size):
-                        request_id = f"personaplex-warmup-{batch_size}-{index}"
+                        request_id = (
+                            f"personaplex-warmup-{batch_size}-{sampling_seed}-{index}"
+                        )
                         payload = StagePayload(
                             request_id,
-                            request=OmniRequest(inputs=None),
+                            request=OmniRequest(
+                                inputs=None, params={"seed": sampling_seed}
+                            ),
                             data=PersonaPlexState(
                                 user_codes=caller_codes,
                             ).to_dict(),
@@ -106,5 +113,5 @@ class PersonaPlexSessionScheduler(OmniScheduler[SGLangARRequestData]):
         elapsed_seconds = time.perf_counter() - started_seconds
         logger.info(
             f"PersonaPlex LM warmup completed for batch sizes 1..{max_batch_size} "
-            f"in {elapsed_seconds:.2f}s"
+            f"with seeded and unseeded sampling in {elapsed_seconds:.2f}s"
         )
