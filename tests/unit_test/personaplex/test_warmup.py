@@ -13,10 +13,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 
 import sglang_omni.models.personaplex.warmup as warmup_module
-from sglang_omni.models.personaplex.warmup import (
-    PersonaPlexSessionScheduler,
-    warmup_session_lm,
-)
+from sglang_omni.models.personaplex.warmup import PersonaPlexSessionScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
 
@@ -69,12 +66,11 @@ class WarmupRunner:
 @pytest.fixture
 def warmup_backend(monkeypatch):
     pool = WarmupRequestPool()
-    scheduler = SimpleNamespace(
-        req_to_token_pool=pool,
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        tree_cache=SimpleNamespace(),
-        model_config=SimpleNamespace(context_len=8192),
-    )
+    scheduler = PersonaPlexSessionScheduler.__new__(PersonaPlexSessionScheduler)
+    scheduler.req_to_token_pool = pool
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace()
+    scheduler.tree_cache = SimpleNamespace()
+    scheduler.model_config = SimpleNamespace(context_len=8192)
     preparations = []
     fail_preparation = []
 
@@ -113,8 +109,9 @@ def warmup_backend(monkeypatch):
 def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_backend):
     scheduler, preparations, _ = warmup_backend
     runner = WarmupRunner()
+    scheduler.model_runner = runner
     original_rng_state = torch.random.get_rng_state()
-    warmup_session_lm(scheduler, runner)
+    scheduler.warm_up_serving_thread()
     assert [len(call) for call in runner.calls] == [1, 1, 2, 2, 3, 3]
     for prompt_call, extend_call in zip(
         runner.calls[::2], runner.calls[1::2], strict=True
@@ -135,9 +132,10 @@ def test_forward_failure_releases_only_warmup_requests_and_restores_rng(
 ):
     scheduler, _, _ = warmup_backend
     runner = WarmupRunner(fail_step=fail_step)
+    scheduler.model_runner = runner
     original_rng_state = torch.random.get_rng_state()
     with pytest.raises(RuntimeError, match="injected forward failure"):
-        warmup_session_lm(scheduler, runner)
+        scheduler.warm_up_serving_thread()
     assert len(runner.calls) == fail_step
     assert scheduler.req_to_token_pool.owned_rows == {99}
     assert torch.equal(torch.random.get_rng_state(), original_rng_state)
@@ -148,8 +146,9 @@ def test_kv_allocation_failure_releases_request_slot_without_releasing_unowned_k
 ):
     scheduler, _, fail_preparation = warmup_backend
     fail_preparation.append(True)
+    scheduler.model_runner = WarmupRunner()
     with pytest.raises(RuntimeError, match="injected KV allocation failure"):
-        warmup_session_lm(scheduler, WarmupRunner())
+        scheduler.warm_up_serving_thread()
     assert scheduler.req_to_token_pool.owned_rows == {99}
     assert scheduler.req_to_token_pool.freed_rows == [1]
 
@@ -168,8 +167,9 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
 
     monkeypatch.setattr(warmup_module, "build_lm_request", build)
     runner = WarmupRunner()
+    scheduler.model_runner = runner
     with pytest.raises(RuntimeError, match="injected request initialization failure"):
-        warmup_session_lm(scheduler, runner)
+        scheduler.warm_up_serving_thread()
     assert len(runner.calls) == 2
     assert all(not request.req.kv.holds_kv for request in built_requests)
     assert scheduler.req_to_token_pool.owned_rows == {99}
@@ -183,6 +183,7 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
 ):
     scheduler, _, _ = warmup_backend
     runner = WarmupRunner(fail_step=fail_step, device="cuda")
+    scheduler.model_runner = runner
     original_release = warmup_module.release_kv_cache
     original_synchronize = torch.accelerator.synchronize
     original_rng_state = torch.cuda.get_rng_state()
@@ -200,10 +201,10 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
     monkeypatch.setattr(warmup_module, "release_kv_cache", release)
     if fail_step is None:
-        warmup_session_lm(scheduler, runner)
+        scheduler.warm_up_serving_thread()
     else:
         with pytest.raises(RuntimeError, match="injected forward failure"):
-            warmup_session_lm(scheduler, runner)
+            scheduler.warm_up_serving_thread()
     assert torch.equal(torch.cuda.get_rng_state(), original_rng_state)
     assert scheduler.req_to_token_pool.owned_rows == {99}
 
@@ -262,21 +263,21 @@ def test_real_batch_preparation_returns_request_and_token_capacity(
                 tree_components=(ComponentType.FULL,),
             )
         )
-        scheduler = SimpleNamespace(
-            req_to_token_pool=request_pool,
-            token_to_kv_pool_allocator=allocator,
-            tree_cache=cache,
-            model_config=SimpleNamespace(
-                context_len=64, vocab_size=32000, is_encoder_decoder=False
-            ),
+        scheduler = PersonaPlexSessionScheduler.__new__(PersonaPlexSessionScheduler)
+        scheduler.req_to_token_pool = request_pool
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.tree_cache = cache
+        scheduler.model_config = SimpleNamespace(
+            context_len=64, vocab_size=32000, is_encoder_decoder=False
         )
         runner = WarmupRunner(fail_step=fail_step, device=device)
+        scheduler.model_runner = runner
         if expected_error is None:
-            warmup_session_lm(scheduler, runner)
+            scheduler.warm_up_serving_thread()
             assert [len(call) for call in runner.calls] == [1, 1, 2, 2, 3, 3]
         else:
             with pytest.raises(RuntimeError, match=expected_error):
-                warmup_session_lm(scheduler, runner)
+                scheduler.warm_up_serving_thread()
         assert request_pool.available_size() == request_capacity - 1
         assert len(set(request_pool.free_slots)) == request_capacity - 1
         assert allocator.available_size() == token_capacity - 1
@@ -285,25 +286,3 @@ def test_real_batch_preparation_returns_request_and_token_capacity(
         assert foreign_rows[0] not in request_pool.free_slots
         assert request_pool.req_to_token[foreign_rows[0], 0] == foreign_tokens[0]
         assert cache.session.slots == {}
-
-
-@pytest.mark.parametrize("fail_warmup", [False, True])
-def test_serving_thread_hook_propagates_warmup_failures(monkeypatch, fail_warmup):
-    scheduler = PersonaPlexSessionScheduler.__new__(PersonaPlexSessionScheduler)
-    scheduler.model_runner = WarmupRunner()
-    calls = []
-
-    def warmup(received_scheduler, received_runner):
-        assert received_scheduler is scheduler
-        assert received_runner is scheduler.model_runner
-        calls.append(True)
-        if fail_warmup:
-            raise RuntimeError("warmup failed")
-
-    monkeypatch.setattr(warmup_module, "warmup_session_lm", warmup)
-    if fail_warmup:
-        with pytest.raises(RuntimeError, match="warmup failed"):
-            scheduler.warm_up_serving_thread()
-    else:
-        scheduler.warm_up_serving_thread()
-    assert calls == [True]
