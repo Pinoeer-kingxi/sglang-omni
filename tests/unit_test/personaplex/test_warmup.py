@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils import DynamicGradMode
 
 import sglang_omni.models.personaplex.warmup as warmup_module
 from sglang_omni.models.personaplex.warmup import PersonaPlexSessionScheduler
@@ -42,8 +43,12 @@ class WarmupRunner:
         )
         self.fail_step = fail_step
         self.calls = []
+        self.grad_modes = []
 
     def execute(self, output) -> ModelRunnerOutput:
+        self.grad_modes.append(
+            (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
+        )
         self.calls.append(
             [
                 (
@@ -116,8 +121,16 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
     scheduler, preparations, _ = warmup_backend
     runner = WarmupRunner()
     scheduler.model_runner = runner
+    original_grad_mode = (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
+    with DynamicGradMode():
+        serving_grad_mode = (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
     original_rng_state = torch.random.get_rng_state()
     scheduler.warm_up_serving_thread()
+    assert set(runner.grad_modes) == {serving_grad_mode}
+    assert (
+        torch.is_grad_enabled(),
+        torch.is_inference_mode_enabled(),
+    ) == original_grad_mode
     assert [len(call) for call in runner.calls] == WARMUP_BATCH_SIZES
     assert [{seed for _, _, seed in call} for call in runner.calls] == [
         {None},
