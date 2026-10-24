@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import DynamicGradMode
 
 from sglang_omni.models.personaplex.architecture import SILENCE_CODES
 from sglang_omni.models.personaplex.model_runner import PersonaPlexModelRunner
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class PersonaPlexSessionScheduler(OmniScheduler[SGLangARRequestData]):
     model_runner: PersonaPlexModelRunner
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def warm_up_serving_thread(self) -> None:
         """Run every supported batch size before the scheduler can report ready."""
         model_runner = self.model_runner
