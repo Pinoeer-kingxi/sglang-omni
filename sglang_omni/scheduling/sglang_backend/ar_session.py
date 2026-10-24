@@ -267,9 +267,14 @@ class ARSessionBridge:
             self.admission = None
 
     def admission_snapshot(self) -> SessionAdmission:
-        admission = SessionAdmission(
-            records=self.bridge_scheduler.tree_cache.session_records()
-        )
+        admission = self.admission
+        if admission is None:
+            admission = SessionAdmission()
+        else:
+            admission.demands.clear()
+            admission.request_rows = 0
+            admission.kv_tokens = 0
+        admission.records = self.bridge_scheduler.tree_cache.session_records()
         for unit in self.units_by_request_id.values():
             admission.include(unit)
         return admission
@@ -596,8 +601,7 @@ class ARSessionBridge:
             admission = self.admission_snapshot()
             self.admission = admission
         else:
-            pass
-        admission.include(unit)
+            admission.include(unit)
         records = admission.records
         assert records is not None
         record = records.get(unit.session_identity.id)

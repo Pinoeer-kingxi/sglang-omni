@@ -270,6 +270,26 @@ def test_admission_checks_the_combined_kv_demand_at_the_exact_boundary(free_toke
     assert message == ("session KV capacity exhausted" if free_tokens == 7 else None)
 
 
+def test_rechecking_a_unit_updates_its_shared_kv_reservation() -> None:
+    """A changed token budget must replace the unit's previous reservation."""
+    scheduler = AdmissionScheduler(request_rows=4)
+    scheduler.token_to_kv_pool_allocator.free_tokens = 8
+    bridge = scheduler.session_bridge
+    with bridge.admission_batch():
+        first = scheduler.build_unit("a")
+        assert bridge.check_session_capacity(first.request_id) is None
+        second = scheduler.build_unit("b")
+        assert bridge.check_session_capacity(second.request_id) is None
+        second.session_request.sampling_params.max_new_tokens = 2
+        assert (
+            bridge.check_session_capacity(second.request_id)
+            == "session KV capacity exhausted"
+        )
+        first.session_request.sampling_params.max_new_tokens = 0
+        assert bridge.check_session_capacity(first.request_id) is None
+        assert bridge.check_session_capacity(second.request_id) is None
+
+
 def test_pending_results_are_collected_before_capacity_is_snapshotted(monkeypatch):
     """A unit completed by the drain must not remain in the next admission budget."""
     scheduler = AdmissionScheduler(request_rows=3)
