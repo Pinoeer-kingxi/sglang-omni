@@ -53,7 +53,7 @@ class DecodeFeedback:
 
 @dataclass(kw_only=True)
 class PersonaPlexFrameBatch:
-    host_rows: torch.Tensor
+    rows: torch.Tensor
     agent_rows: torch.Tensor
     audio_rng_states: list[torch.Tensor | None]
 
@@ -68,6 +68,10 @@ class SamplingRun:
 
 
 class PersonaPlexModelRunner(ModelRunner):
+    @property
+    def keep_audio_on_device(self) -> bool:
+        return self.tp_worker.server_args.enable_streaming_session
+
     def sample_before_post_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -245,16 +249,18 @@ class PersonaPlexModelRunner(ModelRunner):
                 generator.get_state() if generator is not None else None
             )
         packed_rows = torch.cat((text_tokens[:, None], torch.stack(frames)), dim=1)
-        if non_blocking:
+        if self.keep_audio_on_device:
+            rows = packed_rows
+        elif non_blocking:
             # Note (edwardzh): Reused staging can be larger than a shrinking batch.
-            host_rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)[
+            rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)[
                 :batch_size
             ]
-            host_rows.copy_(packed_rows, non_blocking=True)
+            rows.copy_(packed_rows, non_blocking=True)
         else:
-            host_rows = packed_rows.cpu()
+            rows = packed_rows.cpu()
         return PersonaPlexFrameBatch(
-            host_rows=host_rows,
+            rows=rows,
             agent_rows=codes_BK,
             audio_rng_states=audio_rng_states,
         )
@@ -265,8 +271,7 @@ class PersonaPlexModelRunner(ModelRunner):
         result: GenerationBatchResult,
         requests: list[SchedulerRequest],
     ) -> None:
-        host_rows = frames.host_rows
-        self.stage_token_ids(result, host_rows[:, 0])
+        rows = frames.rows
         for index, request in enumerate(requests):
             data = request.data
             if data.req.finished() or data.req.is_retracted:
@@ -275,9 +280,21 @@ class PersonaPlexModelRunner(ModelRunner):
                 pass
             inputs = data.talker_model_inputs
             inputs["agent_rows"].append(frames.agent_rows[index])
-            inputs["frames"].append(host_rows[index, 1:])
-            inputs["pending_frames"].append(host_rows[index, 1:])
+            inputs["frames"].append(rows[index, 1:])
+            inputs["pending_frames"].append(rows[index, 1:])
             self.decode_feedback(data).audio_rng_state = frames.audio_rng_states[index]
+            if self.keep_audio_on_device and (
+                len(data.req.output_ids) + 1 >= data.req.sampling_params.max_new_tokens
+            ):
+                pending = inputs["pending_frames"]
+                inputs["pending_codes"] = (
+                    pending[0][None] if len(pending) == 1 else torch.stack(pending)
+                )
+                inputs["pending_frames"].clear()
+            else:
+                pass
+        # Note (Pinoeer-kingxi): The text completion fence also publishes the unit's device codes before another stage can consume them.
+        self.stage_token_ids(result, rows[:, 0])
 
     def post_decode_launch(
         self,
@@ -301,7 +318,7 @@ class PersonaPlexModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         # Note (edwardzh): Committed history outlives the next reuse of pinned staging.
-        launch_buf.host_rows = launch_buf.host_rows.clone()
+        launch_buf.rows = launch_buf.rows.clone()
         self.commit_frames(launch_buf, result, requests)
 
     def free_codes(self) -> torch.Tensor:
