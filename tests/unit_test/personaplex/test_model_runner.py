@@ -816,7 +816,7 @@ def test_resolve_cuda_copy_while_next_forward_is_slow() -> None:
     completed.record()
     completed.synchronize()
     frames = PersonaPlexFrameBatch(
-        rows=host_rows, agent_rows=device_rows[:, 1:], audio_rng_states=[None]
+        host_rows=host_rows, agent_rows=device_rows[:, 1:], audio_rng_states=[None]
     )
     batch = SimpleNamespace(reqs=[request.data.req])
     pending = PendingStep(
