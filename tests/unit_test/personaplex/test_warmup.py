@@ -17,7 +17,7 @@ import sglang_omni.models.personaplex.warmup as warmup_module
 from sglang_omni.models.personaplex.warmup import PersonaPlexSessionScheduler
 from sglang_omni.scheduling.types import ModelRunnerOutput, RequestOutput
 
-WARMUP_BATCH_SIZES = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+WARMUP_BATCH_SIZES = [1, 1, 2, 2, 3, 3]
 
 
 class WarmupRequestPool:
@@ -46,6 +46,10 @@ class WarmupRunner:
         self.grad_modes = []
 
     def execute(self, output) -> ModelRunnerOutput:
+        for request in output.requests:
+            assert request.data.req.sampling_params.sampling_seed == (
+                request.data.talker_model_inputs["sampling"].text_seed
+            )
         self.grad_modes.append(
             (torch.is_grad_enabled(), torch.is_inference_mode_enabled())
         )
@@ -134,8 +138,6 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
     assert [len(call) for call in runner.calls] == WARMUP_BATCH_SIZES
     assert [{seed for _, _, seed in call} for call in runner.calls] == [
         {None},
-        {None},
-        {0},
         {0},
     ] * 3
     for prompt_call, extend_call in zip(
@@ -145,13 +147,13 @@ def test_warmup_runs_prompt_and_single_row_extend_at_every_batch_size(warmup_bac
         assert all(prefix > 0 and rows == 1 for prefix, rows, _ in extend_call)
     assert torch.equal(torch.random.get_rng_state(), original_rng_state)
     assert scheduler.req_to_token_pool.owned_rows == {99}
-    assert len(scheduler.req_to_token_pool.freed_rows) == 12
+    assert len(scheduler.req_to_token_pool.freed_rows) == 6
     assert all(
         not request.kv.holds_kv for requests in preparations for request in requests
     )
 
 
-@pytest.mark.parametrize("fail_step", range(1, 13))
+@pytest.mark.parametrize("fail_step", range(1, 7))
 def test_forward_failure_releases_only_warmup_requests_and_restores_rng(
     warmup_backend, fail_step
 ):
@@ -184,7 +186,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     built_requests = []
 
     def build(payload, **arguments):
-        if len(built_requests) == 3:
+        if len(built_requests) == 2:
             raise RuntimeError("injected request initialization failure")
         request = original_builder(payload, **arguments)
         built_requests.append(request)
@@ -195,7 +197,7 @@ def test_request_build_failure_does_not_continue_warmup(warmup_backend, monkeypa
     scheduler.model_runner = runner
     with pytest.raises(RuntimeError, match="injected request initialization failure"):
         scheduler.warm_up_serving_thread()
-    assert len(runner.calls) == 4
+    assert len(runner.calls) == 2
     assert all(not request.req.kv.holds_kv for request in built_requests)
     assert scheduler.req_to_token_pool.owned_rows == {99}
 
@@ -253,7 +255,7 @@ def test_cuda_work_finishes_before_kv_release_and_rng_restoration(
     "fail_step,request_capacity,token_capacity,expected_error",
     [
         (None, 4, 128, None),
-        (8, 4, 128, "injected forward failure"),
+        (4, 4, 128, "injected forward failure"),
         (None, 4, 2, "Out of memory"),
         (None, 3, 128, "alloc_req_slots runs out of memory"),
     ],
