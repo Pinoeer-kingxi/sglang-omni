@@ -326,3 +326,33 @@ def test_a_removed_unit_no_longer_reserves_capacity_in_the_admission_batch(relea
         bridge.check_session_capacity(third.request_id)
         == "session KV capacity exhausted"
     )
+
+
+@pytest.mark.parametrize("fail_admission", [False, True])
+def test_scheduler_discards_admission_budget_before_execution(
+    fail_admission: bool,
+) -> None:
+    """Normal and failed admission must not cache demand across scheduler passes."""
+    scheduler = AdmissionScheduler(request_rows=4)
+    scheduler.token_to_kv_pool_allocator.free_tokens = 8
+    bridge = scheduler.session_bridge
+    first = scheduler.build_unit("a")
+    second = scheduler.build_unit("b")
+
+    def admit(payloads: list[StagePayload]) -> None:
+        assert bridge.check_session_capacity(first.request_id) is None
+        assert bridge.check_session_capacity(second.request_id) is None
+        if fail_admission:
+            raise ValueError("admission failed")
+
+    host = SimpleNamespace(session_bridge=bridge, process_input_request_batch=admit)
+    if fail_admission:
+        with pytest.raises(ValueError, match="admission failed"):
+            OmniScheduler.process_input_requests(host, [])
+    else:
+        OmniScheduler.process_input_requests(host, [])
+    first.session_request.sampling_params.max_new_tokens = 2
+    assert (
+        bridge.check_session_capacity(second.request_id)
+        == "session KV capacity exhausted"
+    )

@@ -1218,7 +1218,10 @@ class OmniScheduler(Generic[RequestDataT]):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
         bridge = self.session_bridge
         admission = (
-            bridge.admission_batch() if bridge is not None else contextlib.nullcontext()
+            bridge.admission_batch()
+            if bridge is not None
+            and (len(recv_reqs) > 1 or len(bridge.units_by_request_id) > 1)
+            else contextlib.nullcontext()
         )
         with admission:
             self.process_input_request_batch(recv_reqs)

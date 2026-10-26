@@ -595,20 +595,26 @@ class ARSessionBridge:
         ), f"session capacity check {request_id} requires a session request"
         cache = self.bridge_scheduler.tree_cache
         admission = self.admission
-        if admission is None:
-            admission = self.admission_snapshot()
-        elif admission.records is None:
-            admission = self.admission_snapshot()
-            self.admission = admission
+        if admission is None and len(self.units_by_request_id) == 1:
+            records = cache.session_records()
+            unallocated_request_count = 0
+            reserved_kv_tokens = 0
         else:
-            admission.include(unit)
-        records = admission.records
-        assert records is not None
+            if admission is None:
+                admission = self.admission_snapshot()
+            elif admission.records is None:
+                admission = self.admission_snapshot()
+                self.admission = admission
+            else:
+                admission.include(unit)
+            records = admission.records
+            assert records is not None
+            own_rows, own_tokens = admission.demands[request_id]
+            unallocated_request_count = admission.request_rows - own_rows
+            reserved_kv_tokens = admission.kv_tokens - own_tokens
         record = records.get(unit.session_identity.id)
         retained_kv_tokens = record.kv_allocated_len if record is not None else 0
         free_request_slots = self.bridge_scheduler.req_to_token_pool.free_slots
-        own_rows, own_tokens = admission.demands[request_id]
-        unallocated_request_count = admission.request_rows - own_rows
         if (
             not retained_kv_tokens
             and len(free_request_slots)
@@ -623,7 +629,6 @@ class ARSessionBridge:
             required_kv_tokens = len(session_request.origin_input_ids) + int(
                 session_request.sampling_params.max_new_tokens or 0
             )
-            reserved_kv_tokens = admission.kv_tokens - own_tokens
             available_kv_tokens = (
                 self.bridge_scheduler.token_to_kv_pool_allocator.available_size()
                 + cache.evictable_size()
