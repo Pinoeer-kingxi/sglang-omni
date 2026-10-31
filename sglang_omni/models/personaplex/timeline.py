@@ -21,6 +21,7 @@ row f+1 exists: its first codebook lives at f, the rest at f+1.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import groupby
 
 import torch
 
@@ -211,14 +212,20 @@ class Timeline:
         )
         frames_storage[valid_rows:required_rows].copy_(codes_FK)
         rows_storage[valid_rows:required_rows].fill_(AUDIO_INITIAL_ID)
-        for stream, delay in enumerate(DELAYS[USER_STREAM_OFFSET:]):
+        first_stream = 0
+        for delay, streams in groupby(DELAYS[USER_STREAM_OFFSET:]):
+            end_stream = first_stream + len(tuple(streams))
             first_row = max(valid_rows, delay + 1)
             if first_row < required_rows:
-                rows_storage[first_row:required_rows, stream].copy_(
-                    frames_storage[first_row - delay : required_rows - delay, stream]
+                rows_storage[first_row:required_rows, first_stream:end_stream].copy_(
+                    frames_storage[
+                        first_row - delay : required_rows - delay,
+                        first_stream:end_stream,
+                    ]
                 )
             else:
                 pass
+            first_stream = end_stream
         self.user_frames_storage = frames_storage
         self.user_rows_storage = rows_storage
         self.user_frames = frames_storage[:required_rows]
